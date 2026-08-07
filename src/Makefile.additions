@@ -1,0 +1,16 @@
+# Append these two targets to the RNode_Firmware_CE repo's Makefile.
+# This is a snippet, not a full Makefile -- the base repo's Makefile has many
+# other targets for other boards that aren't reproduced here.
+
+firmware-wio_tracker_l1:
+	arduino-cli compile --log --fqbn Seeeduino:nrf52:wioTrackerL1 -e --build-property "compiler.cpp.extra_flags=\"-DBOARD_MODEL=0x53\""
+
+upload-wio_tracker_l1:
+	arduino-cli upload -p /dev/ttyACM0 --fqbn Seeeduino:nrf52:wioTrackerL1
+	@sleep 6
+	rnodeconf /dev/ttyACM0 --firmware-hash $$(./partition_hashes from_device /dev/ttyACM0)
+
+# Note: the "Seeeduino:nrf52:wioTrackerL1" FQBN is NOT a stock board target.
+# It only exists after running toolchain/setup.sh (or the equivalent manual
+# steps in README.md) to build a hybrid board definition inside the
+# installed Seeeduino:nrf52 Arduino core. See README.md Part 3 for why.
