@@ -1,28 +1,29 @@
-# Wio Tracker L1 Pro — RNode Firmware CE Board Support (Working Draft)
+# Wio Tracker L1 Pro — RNode Firmware CE Board Support
 
 This document records, step by step, how to reproduce a working `RNode_Firmware_CE` build
 for the Seeed Studio Wio Tracker L1 Pro (nRF52840 + Wio-SX1262 + L76K GPS), starting from
 an unmodified clone of [`liberatedsystems/RNode_Firmware_CE`](https://github.com/liberatedsystems/RNode_Firmware_CE).
 
+**Status: working end to end.** The device boots, the SX1262 radio initializes and reports
+correct parameters, and the device has been successfully provisioned and validated with
+`rnodeconf`. Actual over-the-air TX/RX between two nodes has not yet been tested. The
+OLED display is currently disabled pending a driver swap (see Part 6).
+
 **Repo layout:**
 ```
-README.md              -- this file
-src/Boards.h            -- full file, drop-in replacement for RNode_Firmware_CE's Boards.h
-src/Utilities.h         -- full file, drop-in replacement for RNode_Firmware_CE's Utilities.h
-src/RNode_Firmware_CE.ino -- full file, drop-in replacement for RNode_Firmware_CE's .ino
-src/Makefile.additions  -- snippet to append to RNode_Firmware_CE's Makefile
-toolchain/setup.sh      -- reproduces the hybrid board definition described in Part 3
+README.md                    -- this file
+src/Boards.h                 -- full file, drop-in replacement for RNode_Firmware_CE's Boards.h
+src/Utilities.h              -- full file, drop-in replacement for RNode_Firmware_CE's Utilities.h
+src/RNode_Firmware_CE.ino    -- full file, drop-in replacement for RNode_Firmware_CE's .ino
+src/Makefile.additions       -- snippet to append to RNode_Firmware_CE's Makefile
+toolchain/setup.sh           -- reproduces the hybrid Arduino board definition (Part 3)
+toolchain/wio_tracker.cfg    -- OpenOCD config for SWD debugging via a Raspberry Pi (Part 4)
+toolchain/patch_rnodeconf.py -- patches a local rnodeconf install for this board (Part 5)
 ```
 
 To use: clone `RNode_Firmware_CE` separately, copy the three files from `src/` over the
 matching files in that clone, append `src/Makefile.additions` to its `Makefile`, then run
 `toolchain/setup.sh` once before compiling.
-
-**Status:** the board boots and executes application code (confirmed via LED test). Radio
-(SX1262) initialization and `rnodeconf` provisioning have not yet been verified. Several
-pin-mapping and peripheral assumptions below are derived from schematic inspection and
-cross-referencing similar boards, not from official documentation — see the "Open
-questions / unverified assumptions" section at the end.
 
 **Not upstream-ready.** `Documentation/CONTRIBUTING.md` in the RNode_Firmware_CE repo
 explicitly prohibits LLM-authored contributions. This document and the accompanying code
@@ -38,13 +39,16 @@ should hand-write and personally verify their own version of these changes.
 - Radio: Semtech SX1262 (Seeed "Wio-SX1262" module)
 - GPS: Quectel L76K (UART, not used by RNode firmware — no GPS support added)
 - Display: OLED, physically present on this board (1.3", likely SH1106 controller per
-  Zephyr's official board docs — see open questions)
-- Flash: external QSPI (not used by RNode firmware on this build; EEPROM emulation uses
-  internal flash instead)
-- Factory bootloader: **not** the "native" bootloader Zephyr's documentation describes.
-  This specific unit's bootloader was reflashed by Seeed support with a **Seeed XIAO
-  nRF52840** bootloader (`Board-ID: nRF52840-SeeedXiao-v1`, `SoftDevice: S140 7.3.0`).
-  This detail turned out to be load-bearing for the whole toolchain setup below.
+  Zephyr's official board docs — see Part 6, currently disabled)
+- Flash: external QSPI (not used by RNode firmware on this build — EEPROM emulation uses
+  LittleFS on **internal** flash instead, see Part 4)
+- Bootloader: this specific unit's bootloader was reflashed at some point by Seeed support
+  with a **Seeed XIAO nRF52840** bootloader (originally reporting `Board-ID:
+  nRF52840-SeeedXiao-v1`, `SoftDevice: S140 7.3.0` via `INFO_UF2.TXT`). That claimed
+  SoftDevice version turned out to be **inaccurate or the actual binary didn't match** —
+  see Part 4 for the full investigation and fix. The device has since been reflashed with
+  a byte-verified, known-good bootloader+SoftDevice image via SWD.
+- SWD test header: 1x5, 2.0mm pitch, silkscreened (left to right) `GND SWC SWD RST 3V3`.
 
 ---
 
@@ -53,7 +57,9 @@ should hand-write and personally verify their own version of these changes.
 Derived from Seeed's official schematic PDF (`Wio_Tracker_L1_Pro_SCH_PDF.pdf`) and
 cross-confirmed against Zephyr's official `wio_tracker_l1` board devicetree
 (https://docs.zephyrproject.org/latest/boards/seeed/wio_tracker_l1/doc/index.html), which
-matched the schematic net names exactly.
+matched the schematic net names exactly. **All values below are now confirmed correct by
+a fully working, provisioned device** — this is no longer inferred from documentation
+alone.
 
 | Function | nRF52 pin | Arduino pin # (raw passthrough) |
 |---|---|---|
@@ -70,25 +76,32 @@ matched the schematic net names exactly.
 | User button (Menu) | P0.08 | 8 |
 | User LED ("Mesh_LED") | P1.01 | 33 |
 
-**Radio switch config:** Zephyr's docs state the RF switch is "driven by DIO2 plus a
-separate LNA-enable line on P1.08" — i.e. `DIO2_AS_RF_SWITCH = true`, and P1.08 is
-`pin_rxen`, not `pin_txen`. This corrected an earlier wrong assumption (see commit
-history / conversation log if kept).
+**Radio switch config:** `DIO2_AS_RF_SWITCH = true`; P1.08 is `pin_rxen` (LNA/RX-enable),
+not `pin_txen`. Confirmed via Zephyr's board docs and now confirmed working — `rnodeconf
+-i` correctly reports modem chip SX1262 and frequency range 820-1020 MHz.
 
-**TCXO:** confirmed via an unrelated Meshtastic debug log for the same Wio-SX1262 module
-showing `SX126X_DIO3_TCXO_VOLTAGE` configured at 1.8V. So `HAS_TCXO = true`,
-`pin_tcxo_enable = -1` (handled internally by the module, no host GPIO).
+**TCXO:** `HAS_TCXO = true`, `pin_tcxo_enable = -1` (handled internally by the Wio-SX1262
+module).
 
-**Arduino pin numbering convention:** confirmed by inspecting
-`g_ADigitalPinMap` in Adafruit's `pca10056` variant — Arduino pin N maps directly to raw
-nRF52 pin N (i.e. `P1.xx` = `32 + xx`). **This is only true for board variants using raw
-passthrough numbering** — see Part 3, this was a major source of confusion.
+**SPI peripheral:** `NRF_SPIM3` is used for the radio's SPI interface (see Part 2.3).
+SPIM0/SPIM1 are already claimed by this board's two I2C buses (OLED on TWIM0, Grove
+connector on TWIM1) — SPIM/TWIM share underlying hardware per instance number on the
+nRF52840. `NRF_SPIM3` is now confirmed working; `NRF_SPIM2` was never tried since SPIM3
+worked on the first fully-correct attempt.
+
+**Arduino pin numbering convention:** confirmed by inspecting `g_ADigitalPinMap` in
+Adafruit's `pca10056` variant — Arduino pin N maps directly to raw nRF52 pin N (i.e.
+`P1.xx` = `32 + xx`). **This is only true for board variants using raw passthrough
+numbering.** The stock `Seeeduino:nrf52:xiaonRF52840` variant does **not** use this
+scheme — its `g_ADigitalPinMap` is a short, curated table mapping ~30 indices to Seeed's
+own XIAO dev-board silkscreen labels, unrelated to this board's actual wiring. This is why
+the hybrid board definition in Part 3 exists.
 
 ---
 
 ## Part 2 — Firmware source changes
 
-Three files needed changes. All BOARD_MODEL/PRODUCT/MODEL codes were chosen to avoid
+Four files needed changes. All BOARD_MODEL/PRODUCT/MODEL codes were chosen to avoid
 collisions with existing values (checked against every `#define` in `Boards.h`).
 
 ```
@@ -140,7 +153,8 @@ const bool interface_cfg[INTERFACE_COUNT][3] = {
     {
         false, // DEFAULT_SPI -- nRF52+SX1262 boards in this file all use false
         true,  // HAS_TCXO -- confirmed via Wio-SX1262 DIO3 TCXO ref (1.8V)
-        true   // DIO2_AS_RF_SWITCH -- confirmed via Zephyr board docs
+        true   // DIO2_AS_RF_SWITCH -- confirmed via Zephyr board docs, and now
+               //                      confirmed working on real hardware
     },
 };
 const int8_t interface_pins[INTERFACE_COUNT][10] = {
@@ -154,7 +168,7 @@ const int8_t interface_pins[INTERFACE_COUNT][10] = {
         7,  // pin_dio  (LoRa_DIO1, P0.07)
         39, // pin_reset(LoRa_RST,  P1.07)
         -1, // pin_txen
-        40, // pin_rxen (P1.08, LNA/RX-enable per Zephyr docs)
+        40, // pin_rxen (P1.08, RX-enable/LNA-enable per Zephyr docs)
         -1  // pin_tcxo_enable (internal to module)
     }};
 
@@ -167,8 +181,8 @@ const int pin_led_tx = 33;   // Mesh_LED, P1.01 (shared, single LED on board)
 
 ### 2.2 — `Utilities.h`
 
-Three additions were needed here — none of these are obvious from `Boards.h` alone; each
-was found by hitting a compile error or a silent runtime failure.
+Three additions — none of these are obvious from `Boards.h` alone; each was found by
+hitting a compile error or a silent runtime failure.
 
 **A. LED on/off functions.** Every board gets its own explicit
 `led_rx_on/off`/`led_tx_on/off`/`led_id_on/off` block in a separate `#if MCU_VARIANT ==
@@ -189,6 +203,9 @@ Added as a new arm right before the chain's closing `#endif #endif` (after the
 	#endif
 #endif
 ```
+
+Confirmed working — the top LED (silkscreened with a lightning-bolt icon, near the power
+switch) lights correctly.
 
 **B. `eeprom_product_valid()`** — the nRF52 platform check is a hardcoded list of valid
 `PRODUCT_*` codes. Without adding ours, the firmware would compile and flash fine but
@@ -213,12 +230,14 @@ arm (after `BOARD_OPENCOM_XL`):
 
 ### 2.3 — `RNode_Firmware_CE.ino`
 
-The global `interface_spi[1]` SPI object needs board-specific construction on nRF52 (the
-Adafruit-derived `SPIClass` has no default/zero-argument constructor — each nRF52840
-SPIM hardware peripheral instance must be nominated explicitly, since SPIM and TWIM
-share underlying hardware per instance number). Added as a new arm in the existing
-`#if MCU_VARIANT == MCU_NRF52` / `#if BOARD_MODEL == ...` chain near the top of the file
-(after the `BOARD_HELTEC_T114` arm):
+Two separate changes were needed here.
+
+**A. Custom SPI object construction.** The global `interface_spi[1]` SPI object needs
+board-specific construction on nRF52 (the Adafruit-derived `SPIClass` has no
+default/zero-argument constructor — each nRF52840 SPIM hardware peripheral instance must
+be nominated explicitly). Added as a new arm in the existing `#if MCU_VARIANT ==
+MCU_NRF52` / `#if BOARD_MODEL == ...` chain near the top of the file (after the
+`BOARD_HELTEC_T114` arm):
 
 ```cpp
   #elif BOARD_MODEL == BOARD_WIO_TRACKER_L1
@@ -232,11 +251,22 @@ share underlying hardware per instance number). Added as a new arm in the existi
           interface_pins[0][2])};
 ```
 
-`NRF_SPIM3` was chosen because SPIM0 and SPIM1 are already claimed by this board's two
-I2C buses (OLED on TWIM0, Grove connector on TWIM1) — SPIM/TWIM share hardware per
-instance number on the nRF52840, so those two instances were ruled out. Not independently
-confirmed against a datasheet; if the radio never initializes, `NRF_SPIM2` is the next
-thing to try.
+**B. Skip the `while (!Serial)` boot wait.** Every nRF52 board already in this codebase
+— RAK4631, Heltec T114, T-Echo, openCom XL — is explicitly excluded from a
+`while (!Serial);` wait right after `Serial.begin()` in `setup()`. This is because on
+nRF52's native USB CDC (TinyUSB), `Serial`'s boolean state reflects the host asserting
+the DTR control line, which is notoriously unreliable across different serial
+tools/libraries (including `pyserial`, which `rnodeconf` uses). Without this exclusion,
+`rnodeconf` could open the port successfully but get **no response at all** ("Serial port
+opened, but RNode did not respond") because the firmware was stuck forever at this wait,
+never reaching the KISS command loop. Add `BOARD_WIO_TRACKER_L1` to the existing
+exclusion list:
+
+```cpp
+  #if BOARD_MODEL != BOARD_RAK4631 && BOARD_MODEL != BOARD_HELTEC_T114 && BOARD_MODEL != BOARD_TECHO && BOARD_MODEL != BOARD_T3S3 && BOARD_MODEL != BOARD_TBEAM_S_V1 && BOARD_MODEL != BOARD_OPENCOM_XL && BOARD_MODEL != BOARD_WIO_TRACKER_L1
+    while (!Serial);
+  #endif
+```
 
 ### 2.4 — `Makefile`
 
@@ -256,61 +286,40 @@ Note the FQBN — this is **not** a stock board target. See Part 3.
 
 ---
 
-## Part 3 — Toolchain setup (the hard part)
+## Part 3 — Arduino toolchain setup
 
-This is the part that isn't visible in the source diffs above, and cost the most time.
-The short version: **no single stock Arduino board package works correctly for this
-board**, because two independent requirements point at two different, incompatible
-packages.
+No single stock Arduino board package works correctly for this board, because two
+independent requirements point at two different, incompatible packages: correct
+SoftDevice-matched linker/bootloader files, and correct raw pin-passthrough numbering.
 
 ### The problem, in order of discovery
 
-1. **Started with `adafruit:nrf52:pca10056`** (Nordic's own nRF52840 DK target) as the
-   closest available generic nRF52840 core. Got the firmware compiling, but the flashed
-   device never booted — no serial port, no LED, total silence, even with a maximally
-   stripped debug build (`pinMode`/`digitalWrite`/`delay` as the literal first lines of
-   `setup()`).
-
-2. **Root cause: SoftDevice version mismatch.** This board's bootloader (as read from its
-   `INFO_UF2.TXT`) requires `SoftDevice: S140 7.3.0`. The Adafruit core installed
-   (`adafruit:nrf52@1.7.0`) only ships an `nrf52840_s140_v6.ld` linker script for the
-   nRF52840 — no v7 linker script exists for that chip in that core release (only for
-   nRF52833 boards). Compiling against the wrong SoftDevice ABI/vector table causes a
-   hard fault before `setup()` — before even global constructors finish, in this case.
-
-3. **Switched to `Seeeduino:nrf52:xiaonRF52840`** (Seeed's own nRF52 Arduino core,
-   installed via board manager URL
+1. Started with `adafruit:nrf52:pca10056` (Nordic's own nRF52840 DK target). Compiled
+   fine, correct raw pin-passthrough numbering — but the flashed device never booted.
+2. Root cause: this board's bootloader requires SoftDevice `S140 7.3.0`, but the Adafruit
+   core installed only ships an `nrf52840_s140_v6.ld` linker script for the nRF52840 — no
+   v7 script exists for that chip in that core release.
+3. Switched to `Seeeduino:nrf52:xiaonRF52840` (Seeed's own core, installed via
    `https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json`). This
-   package does ship `nrf52840_s140_v7.ld` and matching bootloader/SoftDevice files,
-   confirmed by the linker placing the app at `0x27000` instead of `0x26000` (a ~4KB
-   shift consistent with S140 v7 reserving slightly more flash than v6). Compiled clean.
-   Flashed. Still no boot.
-
-4. **Root cause #2: pin mapping.** The `Seeed_XIAO_nRF52840` variant this FQBN uses does
-   **not** use raw pin passthrough. Its `g_ADigitalPinMap` is a short, curated,
-   reordered table mapping ~30 indices to Seeed's actual XIAO dev-board silkscreen
-   labels (D0–D10, onboard LEDs, IMU, mic, QSPI flash) — completely unrelated to our
-   custom board's wiring. Every pin constant in `Boards.h`/`Utilities.h`/`.ino`, which
-   assumed raw passthrough, was silently wrong under this variant.
-
-5. **Fix: hybrid board definition.** Neither package alone has both (a) the correct
-   S140 v7 linker/SoftDevice and (b) raw pin-passthrough numbering. Built a custom board
-   entry inside the Seeeduino package that reuses Adafruit's `pca10056` variant files
-   (for correct raw-passthrough pins) but keeps Seeeduino's linker/bootloader/SoftDevice
-   settings (for the correct S140 version). This finally produced a booting device.
+   package does ship `nrf52840_s140_v7.ld`, confirmed by the linker placing the app at
+   `0x27000` instead of `0x26000`. Compiled clean — but still didn't boot.
+4. Root cause: the `Seeed_XIAO_nRF52840` variant this FQBN uses does **not** use raw pin
+   passthrough (see Part 1's numbering note).
+5. **Fix: hybrid board definition.** Built a custom board entry inside the Seeeduino
+   package that reuses Adafruit's `pca10056` variant files (for correct raw-passthrough
+   pins) but keeps Seeeduino's linker/bootloader/SoftDevice settings (for the correct
+   S140 version). This got the device booting and executing application code — but a
+   *third*, deeper problem (Part 4) was still hiding underneath before the radio actually
+   worked.
 
 ### Reproduction steps
 
 **1. Install both board packages:**
 
 ```bash
-# Adafruit core (source of the raw pin-passthrough variant files)
 arduino-cli config init
 arduino-cli config add board_manager.additional_urls https://adafruit.github.io/arduino-board-index/package_adafruit_index.json
-
-# Seeeduino core (source of the correct S140 v7 linker/SoftDevice)
 arduino-cli config add board_manager.additional_urls https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
-
 arduino-cli core update-index
 arduino-cli core install adafruit:nrf52
 arduino-cli core install Seeeduino:nrf52
@@ -327,14 +336,9 @@ cp /path/to/packages/adafruit/hardware/nrf52/1.7.0/variants/pca10056/variant.h \
    /path/to/packages/Seeeduino/hardware/nrf52/1.1.13/variants/pca10056_raw/variant.h
 ```
 
-(Adjust version numbers/paths to whatever `arduino-cli core list` reports — these were
-current as of this writing but will drift.)
-
 **3. Append a new board entry to the Seeeduino package's `boards.txt`:**
 
-```bash
-cat >> /path/to/packages/Seeeduino/hardware/nrf52/1.1.13/boards.txt << 'EOF'
-
+```
 wioTrackerL1.name=Wio Tracker L1 Pro (raw pins, S140 v7)
 
 wioTrackerL1.vid.0=0x2886
@@ -363,15 +367,12 @@ wioTrackerL1.build.sd_version=7.3.0
 wioTrackerL1.build.sd_fwid=0x0123
 
 wioTrackerL1.bootloader.tool=bootburn
-EOF
 ```
 
 Note `build.board=Seeed_XIAO_nRF52840` — this is **not** cosmetic. At least one bundled
 library (`Wire_nRF52.cpp`) has a hardcoded `#if defined(ARDUINO_<board>)` check with an
 `#error "Unsupported board"` fallback. Setting `build.board` to a name that library
-already recognizes was the path of least resistance; a truly custom board name would
-require patching every library with a similar check (there may be more we haven't hit
-yet — this was only confirmed for `Wire_nRF52.cpp`).
+already recognizes was the path of least resistance.
 
 **4. Install the one missing library dependency:**
 
@@ -392,9 +393,9 @@ arduino-cli compile --log --fqbn Seeeduino:nrf52:wioTrackerL1 -e \
 **6. Convert the resulting `.hex` to `.uf2`**, using this board's actual bootloader
 family ID — **not** the generic `NRF52` entry in `uf2conv.py`'s built-in table. The
 correct value, `0x28860044`, was extracted by parsing the UF2 header of the
-factory-installed (working) Meshtastic firmware that was on the device before we started
-(the first 4 bytes, `0x2886`, match Seeed's registered USB Vendor ID — this appears to be
-a deliberate VID-derived scheme, not arbitrary):
+factory-installed (working) Meshtastic firmware that was originally on the device (the
+first 4 bytes, `0x2886`, match Seeed's registered USB Vendor ID — this is a deliberate
+VID-derived scheme, not arbitrary):
 
 ```bash
 python3 /path/to/packages/Seeeduino/hardware/nrf52/1.1.13/tools/uf2conv/uf2conv.py \
@@ -403,12 +404,11 @@ python3 /path/to/packages/Seeeduino/hardware/nrf52/1.1.13/tools/uf2conv/uf2conv.
   build/Seeeduino.nrf52.wioTrackerL1/RNode_Firmware_CE.ino.hex
 ```
 
-Sanity check: this should report `start address: 0x27000`. If it reports `0x26000`
-you're accidentally still linked against v6 — check `build.ldscript` in the board entry.
+Sanity check: this should report `start address: 0x27000`.
 
 **7. Flash it.** Enter bootloader mode by **holding** (not double-tapping) the reset
 button — this specific bootloader responds to press-and-hold, not the double-tap gesture
-described in Zephyr's generic documentation. Then:
+described in generic documentation. Then:
 
 ```bash
 cp build/Seeeduino.nrf52.wioTrackerL1/RNode_Firmware_CE.ino.uf2 /Volumes/XIAO-BOOT/
@@ -419,36 +419,305 @@ Use `cp` from a terminal, not Finder/Explorer drag-and-drop — Finder has throw
 
 ---
 
-## Open questions / unverified assumptions
+## Part 4 — The SoftDevice/bootloader root cause (SWD debugging)
 
-Listed roughly in order of how likely each is to bite next:
+Even with the toolchain fixed (Part 3), the board would boot and execute early code, but
+`eeprom_begin()` — specifically the very first genuine SoftDevice flash-write operation
+the firmware performs — would hang forever with no serial output and no error. This
+turned out to require actual hardware debugging to solve; LED-based bisection alone
+wasn't enough to find it. This section is included in full because the debugging
+technique (SWD via a Raspberry Pi's GPIO header, no dedicated probe hardware) is broadly
+reusable for anyone hitting similarly opaque nRF52 SoftDevice issues.
 
-- **`NRF_SPIM3` for the radio SPI** — chosen by elimination (SPIM0/1 are claimed by the
-  two I2C buses) but not confirmed against a datasheet or working radio test. If the
-  radio never initializes despite everything else working, try `NRF_SPIM2`.
-- **LED polarity** (`HIGH` = on) — confirmed correct empirically (the LED does light).
-- **OLED controller: SSD1306 vs SH1106.** The firmware links `Adafruit_SSD1306`, but
-  Zephyr's official hardware description for this exact board states the panel is an
-  **SH1106** controller — a different, incompatible init/command sequence despite
-  identical form factor and I2C protocol layer. Not yet tested; if the board boots fully
-  but the display stays dark while everything else works, this is the first place to
-  look.
-- **`HAS_CONSOLE false`** — set to match every other nRF52 board in this codebase, on
-  the assumption that the bootstrap-console feature needs more flash than these boards
-  comfortably spare. Not independently verified for this board's actual QSPI flash
-  capacity (2MB per the schematic, which is more generous than most nRF52 boards here —
-  worth reconsidering once the radio path is confirmed working).
+### Setting up SWD via a Raspberry Pi
+
+No dedicated SWD probe is needed — a Raspberry Pi's GPIO header can bit-bang the SWD
+protocol directly via OpenOCD.
+
+**Wiring** (board silkscreen, left to right: `GND SWC SWD RST 3V3` — **do not connect
+3V3**, the board is already powered via USB and back-feeding the rail from the Pi risks a
+supply conflict):
+
+| Board pin | Signal | Pi connection |
+|---|---|---|
+| 1 | GND | Pi GND |
+| 2 | SWC (SWCLK) | Any free GPIO (avoid GPIO 0/1) |
+| 3 | SWD (SWDIO) | Any free GPIO (avoid GPIO 0/1) |
+| 4 | RST | Not connected (OpenOCD resets via the debug port itself) |
+| 5 | 3V3 | **Not connected** |
+
+The board's SWD header is 1x5, 2.0mm pitch — narrower than standard 2.54mm headers.
+Either solder solid-core wire directly into the three needed holes, or use a 2.0mm-pitch
+header/pogo pins if available.
+
+**Install OpenOCD on the Pi:**
+```bash
+sudo apt install openocd
+```
+
+**Config** (`toolchain/wio_tracker.cfg` in this repo — using BCM GPIO 25/24 as an
+example, adjust to match your wiring):
+```
+adapter driver linuxgpiod
+
+transport select swd
+
+adapter gpio swclk -chip 0 25
+adapter gpio swdio -chip 0 24
+
+adapter speed 1000
+
+source [find target/nrf52.cfg]
+```
+
+**Connect:**
+```bash
+sudo openocd -f wio_tracker.cfg
+```
+
+A successful connection reports detecting the Cortex-M4 core and "Examination succeed."
+In a second terminal, use `nc localhost 4444` to reach OpenOCD's Tcl console (`telnet`
+may not be installed by default on Raspberry Pi OS; `nc` works identically for this).
+
+### Diagnosing the hang
+
+With the hang reproduced (board flashed with firmware that calls into `eeprom_begin()`):
+```
+halt
+reg pc
+```
+
+This returned a fixed, repeatable address every time, which `arm-none-eabi-addr2line`
+(bundled with the Arduino core's toolchain) resolved to `HardFault_Handler`:
+```bash
+/path/to/packages/Seeeduino/tools/arm-none-eabi-gcc/9-2019q4/bin/arm-none-eabi-addr2line \
+  -e build/.../fs_test.ino.elf -f -C 0xPC_VALUE
+```
+
+Reading the exception stack frame (pushed automatically by the hardware at fault time,
+laid out as `R0 R1 R2 R3 R12 LR PC xPSR` starting at the stack pointer) gave the *actual*
+faulting PC and the calling function's return address:
+```
+reg sp
+mdw 0x<SP>+0x18 1    # stacked PC  (offset 24 bytes)
+mdw 0x<SP>+0x14 1    # stacked LR  (offset 20 bytes)
+```
+
+And the CPU fault status registers, which classify *why* it faulted:
+```
+mdw 0xE000ED28 1    # CFSR - Configurable Fault Status Register
+mdw 0xE000ED2C 1    # HFSR - HardFault Status Register
+```
+
+Result: `CFSR` bit 8 set (`IBUSERR` — instruction bus error), `HFSR` bit 30 set
+(`FORCED` — a lower-priority fault escalated to HardFault). The stacked PC was a
+nonsensical address outside any valid flash/RAM region. The stacked LR resolved (via
+`addr2line`) to an address *inside the closed-source SoftDevice binary itself* — meaning
+the crash wasn't in our code, but inside the SoftDevice's own internal logic while
+handling our flash-erase request.
+
+### Ruling out RAM sizing and variant/linker mismatches
+
+Several plausible causes were tested and eliminated with direct evidence before finding
+the real one:
+- **RAM reservation size** — deliberately increased the linker's RAM origin by 40KB as a
+  test. Rebuilt, reflashed, re-checked via OpenOCD: **identical PC and LR** as before,
+  down to the exact address. Ruled out.
+- **Hardcoded flash addresses in the copied `variant.cpp`** — grepped for `0x26000`,
+  `VTOR`, vector table references: none found.
+- **Core-level branching on the `_VARIANT_PCA10056_` macro** — grepped the entire
+  Seeeduino core: no references at all, confirmed inert.
+
+### The actual root cause
+
+With the variant/linker layer ruled out, the remaining explanation was that the
+SoftDevice binary itself — whatever Seeed's support team had actually flashed onto this
+specific chip during an earlier recovery — didn't genuinely match what `INFO_UF2.TXT`
+claimed (`S140 7.3.0`). **Fix: reflash a byte-verified, known-good combined
+bootloader+SoftDevice image directly over SWD**, bypassing any uncertainty about what was
+actually in flash:
+
+```bash
+# Mass-erase first
+sudo openocd -f wio_tracker.cfg -c "init" -c "reset halt" -c "nrf5 mass_erase" -c "shutdown"
+
+# Flash the combined image (ships with the Seeeduino core itself)
+sudo openocd -f wio_tracker.cfg -c "program /path/to/Seeed_XIAO_nRF52840_bootloader-0.6.2_s140_7.3.0.hex verify reset exit"
+```
+
+That file lives at:
+```
+<Seeeduino core dir>/bootloader/Seeed_XIAO_nRF52840/Seeed_XIAO_nRF52840_bootloader-0.6.2_s140_7.3.0.hex
+```
+
+After this reflash, the identical `fs_test` build that previously hard-faulted every
+single time ran cleanly — confirmed via OpenOCD showing `Handler PendSV` (normal
+FreeRTOS scheduler activity, with the PC advancing between successive halts) rather than
+`Handler HardFault` stuck at a fixed address, and both `CFSR`/`HFSR` reading `0x00000000`
+(no fault flags set at all).
+
+**Important operational note:** after flashing an application `.hex` directly over SWD
+(bypassing the normal UF2 flow), the bootloader's own "valid application present" flag
+does **not** get updated, so it won't boot into that application — it'll just sit in
+DFU/bootloader mode. **Always flash the actual application firmware via the normal UF2
+drag-and-drop flow** (Part 3, step 7), even after using SWD to fix the bootloader/
+SoftDevice itself. SWD is for bootloader/SoftDevice-level work and low-level debugging;
+UF2 is for application firmware.
+
+**Safety note on this whole procedure:** this is very hard to actually brick. SWD access
+is a hardware debug port independent of flash contents — as long as OpenOCD can connect
+(which is easy to verify with a plain `reset halt`/`reg pc` before attempting anything
+destructive), a bad write can always be corrected with another mass-erase and reflash.
+The only realistic way to lose SWD access entirely is if something sets nRF52's
+APPROTECT (Access Port Protection) bit in UICR, which none of the commands here do.
+
+---
+
+## Part 5 — Provisioning with `rnodeconf`
+
+Once the firmware boots and the radio initializes, the device still needs to be
+provisioned (product/model/hardware-revision/serial/timestamp written to EEPROM, along
+with a checksum and cryptographic signature) before `rnodeconf` will consider it a valid
+RNode.
+
+### Do not use `rnodeconf --autoinstall` or the guided device-type menu
+
+Both of these assume you're setting up one of `rnodeconf`'s known, hardcoded board types
+and will offer to **flash a generic stock firmware image** for whatever board you select
+— which would silently overwrite this custom build with completely wrong firmware for
+different hardware. Avoid any prompt that asks "what kind of device is this?" and offers
+a numbered list of board options.
+
+### Provisioning with explicit product/model codes
+
+`rnodeconf` does support bootstrapping EEPROM with arbitrary custom codes via CLI flags —
+this isn't gated behind its internal board tables the way the guided flow is. The one
+formatting gotcha: hex values must be passed **without** a `0x` prefix (bare two-digit
+hex, e.g. `19` not `0x19`):
+
+```bash
+rnodeconf /dev/cu.usbmodemXXXX -r --platform 70 --product 19 --model 1a --hwrev 1
+```
+
+(`-r`/`--rom` bootstraps EEPROM only, no firmware flash; `70` = `PLATFORM_NRF52`, `19` =
+`PRODUCT_WIO_TRACKER_L1`, `1a` = `MODEL_1A`)
+
+If a previous provisioning attempt already wrote a valid-checksummed EEPROM (even with
+wrong values, e.g. from a different tool defaulting to generic codes), `rnodeconf` will
+refuse to overwrite it. Wipe first:
+```bash
+rnodeconf /dev/cu.usbmodemXXXX --eeprom-wipe
+```
+
+### A write-timing bug specific to this board, and the fix
+
+The bootstrap process would consistently fail partway through — not randomly, but at
+almost exactly the same byte offset every time — with "EEPROM was written, but
+validation failed." Dumping the EEPROM directly (`rnodeconf --eeprom-dump`) and comparing
+against the expected field layout (`product, model, hwrev, serial[4], made[4],
+checksum[16], signature[128], lock_byte` — total 155 bytes before the lock byte) showed
+the write consistently stopped partway through the 128-byte signature block, never
+reaching the final lock byte.
+
+**Root cause:** `rnodeconf.py`'s EEPROM bootstrap routine writes each byte individually
+via KISS commands with a hardcoded `time.sleep(0.006)` (6ms) between writes. This board's
+EEPROM is emulated via LittleFS on **internal flash** (`HAS_EEPROM false`, not a real
+EEPROM peripheral), and each individual byte write goes through real flash erase/program
+operations — genuinely slower than 6ms allows for. The fixed writes-per-second pacing
+this delay assumes doesn't hold for this board's storage backend, and later writes in the
+sequence get lost once some backlog finally overflows.
+
+**Fix:** locally patch the installed `rnodeconf.py` to use a longer delay. `0.006` →
+`0.05` got partway further (fewer missing bytes, confirming the theory); `0.006` → `0.15`
+completed the full write cleanly (confirmed via checksum-correct + signature-validated on
+the next read):
+
+```bash
+sed -i '' 's/time\.sleep(0\.006)/time.sleep(0.15)/g' \
+  /path/to/site-packages/RNS/Utilities/rnodeconf.py
+```
+
+(`toolchain/patch_rnodeconf.py` in this repo automates this and the two display-crash
+fixes below — point it at your local `rnodeconf.py` path.)
+
+This patch lives in your local Python environment, not this repo's own code — **it will
+be lost if the `rns` package is reinstalled or updated**, and will need reapplying.
+
+### Two unrelated display-crash bugs in `rnodeconf -i`
+
+Separately, `rnodeconf -i` (device info display) crashes with an unhandled `KeyError` for
+any product/model code not in its local, hardcoded `products`/`models` Python
+dictionaries — which of course don't know about custom codes like ours. This doesn't
+indicate anything wrong with the device (checksum/signature validation, which happens
+*before* this display code runs, already succeeded by the time these crashes occur) —
+it's purely a cosmetic bug in the info-printing code. Two separate unguarded dictionary
+lookups needed guarding:
+
+1. `models[rnode.model][4]` (used to look up a firmware filename during device-info
+   reads) — wrap in `try/except KeyError`.
+2. `products[rnode.product]`, `models[rnode.model][3]`, and `models[rnode.model][5]` (used
+   in the formatted "Device info:" printout) — replace with `x if key in dict else
+   "Unknown ..."` fallback expressions.
+
+Both patches are included in `toolchain/patch_rnodeconf.py`.
+
+### Confirmed working end state
+
+After applying all three patches and provisioning cleanly:
+```
+rnodeconf /dev/cu.usbmodemXXXX -i
+```
+reports: firmware version 1.75, EEPROM checksum correct, device signature validated
+(against the local signing key used to provision it), product/model bytes matching
+`19:1a:53` exactly, device mode "Normal (host-controlled)". The earlier radio test
+(`rnodeconf ... --freq ... --bw ... --sf ... -T`) had already independently confirmed the
+device correctly echoes back frequency/bandwidth/spreading-factor/coding-rate and
+switches to TNC mode without error.
+
+---
+
+## Part 6 — Open questions / unverified assumptions
+
+- **OLED display is currently disabled (`HAS_DISPLAY false`)** and is the main remaining
+  known gap. The firmware links `Adafruit_SSD1306`, but Zephyr's official hardware
+  description for this exact board states the panel is an **SH1106** controller — a
+  different, incompatible init/command sequence despite identical form factor and I2C
+  protocol layer. This was directly observed: with `HAS_DISPLAY true`, the firmware would
+  hang inside `TwoWire::endTransmission()` (confirmed via OpenOCD/`addr2line`, PC
+  captured mid-I2C-transaction), consistent with the display never ACKing correctly.
+  Fixing this means swapping to `Adafruit_SH110X` in `Display.h` — a real but likely
+  fairly mechanical change, since both libraries share the Adafruit_GFX-based API. Not
+  yet attempted.
+- **`NRF_SPIM3` for the radio SPI** — chosen by elimination (SPIM0/1 claimed by the two
+  I2C buses), and now confirmed working via a fully functional radio. `NRF_SPIM2` was
+  never needed.
+- **`HAS_CONSOLE false`** — set to match every other nRF52 board in this codebase.
+  Not independently reconsidered given the board's relatively generous 2MB QSPI flash
+  (unused by RNode firmware currently) — worth revisiting once other work is further
+  along, low priority.
 - **GPS (L76K) is entirely unimplemented.** The schematic shows GPS UART/reset/wakeup
   pins, and `BOARD_HELTEC_T114`'s `MODEL_CB` variant shows precedent for `HAS_GPS` in
   this codebase, but this hasn't been attempted here.
-- **Radio has not been tested at all** — everything above only confirms the MCU boots
-  and runs application code. SX1262 `preInit()`, `rnodeconf` provisioning, and actual
-  TX/RX are all still open.
+- **Actual over-the-air radio TX/RX has not been tested** — everything confirmed so far
+  is: the SX1262 initializes, reports correct chip/frequency-range info, and accepts
+  frequency/bandwidth/SF/CR configuration commands without error. A real two-node
+  transmission test (or checking against an SDR) would be the next real confirmation that
+  the radio is fully functional, not just correctly configured.
+- **Device signature trust** — the device is provisioned and self-signed with a locally
+  generated key (via the web flasher's initial provisioning attempt, later fully
+  completed via `rnodeconf`'s own bootstrap). `rnodeconf` on *other* machines will show
+  the "device signature validation failed" warning unless that signing key (or a trusted
+  public key derived from it) is present. This is expected/correct behavior for a
+  self-provisioned homebrew device, not a defect — see `rnodeconf --help`'s `-P`/
+  `--trust-key` flags if resolving this for cross-machine trust is ever wanted.
 - **This toolchain setup is fragile and non-reproducible via standard tooling.** The
-  hybrid board definition lives entirely in hand-edited files inside the installed
-  Arduino package directory, not in version control, and will be wiped out by any core
-  reinstall/update. If this ever needs to go upstream, the real fix is getting a proper
-  nRF52840 + S140 v7 + raw-pin-passthrough variant into a public board index — either by
-  raising it with Seeed, or building a genuinely custom Arduino core package that ships
-  its own variant/boards.txt/linker files rather than depending on splicing two existing
-  packages together by hand.
+  hybrid Arduino board definition (Part 3) and the `rnodeconf` patches (Part 5) both live
+  in hand-edited files outside this repo — inside the installed Arduino package directory
+  and the installed `rns` Python package, respectively — and will be wiped out by a core
+  reinstall/update or a `pip install --upgrade rns`. The `toolchain/setup.sh` and
+  `toolchain/patch_rnodeconf.py` scripts in this repo exist specifically to make
+  reapplying both fast when that happens. If this ever needs to go upstream, the real
+  fixes are: getting a proper nRF52840 + S140 v7 + raw-pin-passthrough variant into a
+  public Arduino board index, and getting the `rnodeconf` write-timing/display bugs fixed
+  in the actual Reticulum project (the timing issue in particular seems like it could
+  affect any board using flash-emulated EEPROM, not just this one).
