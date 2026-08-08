@@ -1,5 +1,9 @@
 # Wio Tracker L1 Pro — RNode Firmware CE Board Support
 
+################################################################################################
+### Enormous Disclaimer: This whole document, and indeed all of the steps described below were created by Claude. I am not anywhere near technically proficient enough to have debugged or figured any of this out by myself. Reproduce or use this code at your own risk
+################################################################################################
+
 This document records, step by step, how to reproduce a working `RNode_Firmware_CE` build
 for the Seeed Studio Wio Tracker L1 Pro (nRF52840 + Wio-SX1262 + L76K GPS), starting from
 an unmodified clone of [`liberatedsystems/RNode_Firmware_CE`](https://github.com/liberatedsystems/RNode_Firmware_CE).
