@@ -1375,6 +1375,15 @@ const int8_t interface_pins[INTERFACE_COUNT][10] = {
 #define HAS_NP false
 #define HAS_SD false
 #define HAS_INPUT true
+// VALIDATE_FIRMWARE is disabled for this board -- see README.md Part 8.
+// device_init()'s firmware-hash check reads a size field from a fixed flash
+// address (IMG_SIZE_START) that this board's bootloader does not appear to
+// populate the way this code expects (confirmed via SWD to read all zeros),
+// which permanently blocks hw_ready with VALIDATE_FIRMWARE left on. This is
+// a real, known tradeoff (firmware integrity self-check disabled), not a
+// cosmetic silencing of a false positive -- flag prominently in any upstream
+// review rather than carrying it forward silently.
+#define VALIDATE_FIRMWARE false
 #define CONFIG_UART_BUFFER_SIZE 6144
 #define CONFIG_QUEUE_0_SIZE 6144
 #define CONFIG_QUEUE_MAX_LENGTH 200

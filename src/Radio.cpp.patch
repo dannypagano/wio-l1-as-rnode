@@ -1,0 +1,33 @@
+# Radio.cpp changes for Wio Tracker L1 Pro
+#
+# Unlike Boards.h/Utilities.h/RNode_Firmware_CE.ino, this is NOT a full-file
+# drop-in replacement -- only the specific snippet below needs changing in
+# your own Radio.cpp. See README.md Part 7 for the full explanation.
+#
+# Locate the TCXO configuration function (look for MODE_TCXO_1_8V_6X /
+# MODE_TCXO_3_3V_6X), and add BOARD_WIO_TRACKER_L1 to the board list that
+# gets a real TCXO buffer, rather than falling through to the #else zero
+# buffer (which disables/misconfigures the TCXO reference for boards that
+# aren't explicitly listed):
+
+    #elif BOARD_MODEL == BOARD_E22_ESP32
+      uint8_t buf[4] = {MODE_TCXO_1_8V_6X, 0x00, 0x00, 0xFF};
+    #elif BOARD_MODEL == BOARD_WIO_TRACKER_L1
+      uint8_t buf[4] = {MODE_TCXO_1_8V_6X, 0x00, 0x00, 0xFF};
+    #else
+      uint8_t buf[4] = {0};
+    #endif
+
+# 1.8V matches the Wio-SX1262 module's TCXO reference voltage, confirmed via
+# an external Meshtastic debug log for the same module (see README.md Part 1).
+#
+# NOTE: this fix was identified and written up during the debugging session,
+# but its actual effect was never independently isolated and reconfirmed --
+# by the time TX power (a separate, unrelated bug, see Utilities.h's
+# setTXPower changes) was fixed and the radio was confirmed working, both
+# fixes were in place together. It's very likely still worth keeping (an
+# unconfigured TCXO reference is a real correctness issue for frequency
+# accuracy regardless of whether it was the direct cause of any single
+# symptom observed), but if you're bisecting for a different problem, don't
+# assume this one has been proven necessary in isolation -- verify directly
+# if it matters for what you're debugging.
