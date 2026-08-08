@@ -4,10 +4,27 @@ This document records, step by step, how to reproduce a working `RNode_Firmware_
 for the Seeed Studio Wio Tracker L1 Pro (nRF52840 + Wio-SX1262 + L76K GPS), starting from
 an unmodified clone of [`liberatedsystems/RNode_Firmware_CE`](https://github.com/liberatedsystems/RNode_Firmware_CE).
 
-**Status: working end to end.** The device boots, the SX1262 radio initializes and reports
-correct parameters, and the device has been successfully provisioned and validated with
-`rnodeconf`. Actual over-the-air TX/RX between two nodes has not yet been tested. The
-OLED display is currently disabled pending a driver swap (see Part 6).
+**Status: confirmed working, live, as a real Reticulum interface.** The device boots, is
+provisioned and validated with `rnodeconf`, and has been used successfully as an
+`RNodeInterface` in a real Reticulum config (`rnsd`/Sideband) -- reporting `Status: Up`,
+real traffic counters, and a live noise-floor RF reading (-104 dBm), confirming the radio
+is genuinely receiving, not just reporting a fake "on" state. Real over-the-air TX/RX
+*between two nodes* has not yet been separately confirmed. The OLED display is currently
+disabled pending a driver swap (see Part 8).
+
+**Two further bugs were found and fixed after initial radio bring-up** (Parts 6 and 7):
+a firmware bug that silently dropped TX power for any unlisted board model, and a
+bootloader/firmware mismatch that permanently blocked the radio from turning on at all
+under RNS (as opposed to `rnodeconf`, which uses different, less strict validation and
+didn't catch it). Part 8's fix in particular is a real security tradeoff (disables a
+firmware integrity check), not just a bug fix -- read it before assuming it's the right
+permanent answer.
+
+**Upstream plan:** several fixes from this session are genuinely board-agnostic bugs
+(not just Wio Tracker L1 Pro accommodations) and are worth proposing upstream once
+reviewed and hand-verified per `CONTRIBUTING.md`'s no-LLM-authorship rule -- see Part 10
+for a prioritized list of what's likely worth submitting versus what's still an open
+question.
 
 **Repo layout:**
 ```
@@ -15,10 +32,12 @@ README.md                    -- this file
 src/Boards.h                 -- full file, drop-in replacement for RNode_Firmware_CE's Boards.h
 src/Utilities.h              -- full file, drop-in replacement for RNode_Firmware_CE's Utilities.h
 src/RNode_Firmware_CE.ino    -- full file, drop-in replacement for RNode_Firmware_CE's .ino
+src/Radio.cpp.patch          -- snippet only (not a full file) -- see Part 6
 src/Makefile.additions       -- snippet to append to RNode_Firmware_CE's Makefile
 toolchain/setup.sh           -- reproduces the hybrid Arduino board definition (Part 3)
 toolchain/wio_tracker.cfg    -- OpenOCD config for SWD debugging via a Raspberry Pi (Part 4)
 toolchain/patch_rnodeconf.py -- patches a local rnodeconf install for this board (Part 5)
+toolchain/kiss-debug-scripts/raw_initradio_test.py -- raw KISS protocol test tool (Part 7)
 ```
 
 To use: clone `RNode_Firmware_CE` separately, copy the three files from `src/` over the
@@ -39,7 +58,7 @@ should hand-write and personally verify their own version of these changes.
 - Radio: Semtech SX1262 (Seeed "Wio-SX1262" module)
 - GPS: Quectel L76K (UART, not used by RNode firmware — no GPS support added)
 - Display: OLED, physically present on this board (1.3", likely SH1106 controller per
-  Zephyr's official board docs — see Part 6, currently disabled)
+  Zephyr's official board docs — see Part 9, currently disabled)
 - Flash: external QSPI (not used by RNode firmware on this build — EEPROM emulation uses
   LittleFS on **internal** flash instead, see Part 4)
 - Bootloader: this specific unit's bootloader was reflashed at some point by Seeed support
@@ -676,7 +695,229 @@ switches to TNC mode without error.
 
 ---
 
-## Part 6 — Open questions / unverified assumptions
+## Part 6 — TX power bug: a silent, model-gated no-op
+
+After initial radio bring-up, every radio parameter reported back correctly through
+`rnodeconf` except TX power, which always came back as `0 dBm` regardless of what was
+requested (`--txp 14` reported "TX power is 0 dBm"). This affected every test, using
+either `rnodeconf` directly or a real RNS config through Sideband (which surfaced it as
+a hard startup failure: `"TX power mismatch"`).
+
+**Root cause:** the KISS `CMD_TXPOWER` handler in `RNode_Firmware_CE.ino` doesn't call a
+method on the radio object directly (unlike frequency, bandwidth, SF, and CR, which all
+do: `selected_radio->setFrequency(freq)` etc.). It calls a separate free-standing wrapper
+function instead:
+
+```cpp
+if (op_mode == MODE_HOST) setTXPower(selected_radio, txp);
+```
+
+That wrapper, in `Utilities.h`, is an exhaustive `if (model == MODEL_XX) radio->setTxPower(...)`
+chain covering every model code in the entire codebase individually, **with no `else`/
+default fallback at all**. Confirmed by reading through to the function's literal closing
+brace. Since `MODEL_1A` (our board) was never added to this list, every `if` fails to
+match, the function falls through having done nothing, and the radio's internal `_txp`
+value stays at its constructor default of `0` forever -- regardless of what's requested.
+
+The maintainer's own comment at the top of this function acknowledges it's a known rough
+edge: *"Todo, revamp this function. The current parameters for setTxPower are suboptimal,
+as some chips have power amplifiers which means that the max dBm is not always the same."*
+Every new board added to this codebase has to remember to add itself here, or TX power
+silently does nothing -- a sharp, easy-to-miss edge for anyone porting a new board.
+
+**Fix:** add our model, matching every other SX1262-based model's parameter
+(`PA_OUTPUT_PA_BOOST_PIN` -- `PA_OUTPUT_RFO_PIN` is only used by SX1276/SX1278 models):
+
+```cpp
+if (model == MODEL_1A) radio->setTxPower(txp, PA_OUTPUT_PA_BOOST_PIN);
+```
+
+This is a genuine, board-agnostic bug -- worth prioritizing for upstream contribution
+separately from anything else in this repo, since it would affect any new SX1262/SX1280
+board added to this codebase, not just this one.
+
+### A related, unconfirmed fix found along the way: TCXO configuration
+
+While investigating the TX power issue, a separate board-list gap was found in
+`Radio.cpp`'s TCXO configuration function -- `BOARD_WIO_TRACKER_L1` was missing from the
+list of boards that get a real TCXO voltage/timeout buffer sent to the chip, falling
+through to an all-zero buffer (no TCXO configuration at all) instead. Since `HAS_TCXO =
+true` is set for this board in `Boards.h`, this was a real gap. See `src/Radio.cpp.patch`
+for the fix (`MODE_TCXO_1_8V_6X`, matching the Wio-SX1262 module's confirmed 1.8V
+reference).
+
+**Caveat:** unlike the TX power fix, this one's actual effect was never independently
+isolated and reconfirmed in a controlled way -- it was applied around the same time as
+other changes, and by the time the radio was confirmed fully working, several fixes were
+in place together. It's very likely still worth keeping (an unconfigured TCXO reference
+is a real correctness issue for frequency accuracy on its own), but don't cite it as a
+confirmed fix for any *specific* symptom without re-testing it in isolation.
+
+---
+
+## Part 7 — The radio wouldn't turn on under RNS (but `rnodeconf` didn't catch it)
+
+Even after the TX power fix, Sideband/RNS still failed with `"Radio state mismatch"` --
+a different, more fundamental check than the individual-parameter validation TX power
+had been tripping. `rnodeconf`'s own TNC-mode tests, by contrast, appeared to succeed.
+
+### Why `rnodeconf` didn't catch this
+
+`rnodeconf.py` and RNS's `RNodeInterface.py` are two entirely separate implementations of
+the serial protocol -- `rnodeconf` doesn't reuse `RNodeInterface` at all, and applies
+different (weaker) success criteria. This was a genuine trap during debugging: several
+rounds of testing via `rnodeconf` looked successful and seemed to rule out a real
+firmware-level problem, when the actual issue only showed up under `RNodeInterface`'s
+stricter validation (`RNodeInterface.validateRadioState()` explicitly requires a real,
+confirmed `r_state` echo from the device matching what was requested -- see
+`RNS/Interfaces/RNodeInterface.py`).
+
+### Isolating the real cause with raw KISS commands
+
+Rather than keep guessing from two different tools' differing behavior, a small raw
+KISS-protocol test script (`toolchain/kiss-debug-scripts/raw_initradio_test.py`) was
+used to replicate RNS's exact `initRadio()` command sequence directly over the serial
+port and observe raw byte-level responses. This ruled out, in order:
+
+1. **Mode gating** (`op_mode == MODE_HOST`) -- ruled out because frequency/bandwidth/SF/
+   CR all correctly applied and echoed back despite sharing the identical gating pattern
+   with TX power; if mode gating were blocking commands, all of them should have failed
+   identically.
+2. **Radio lock** (`CMD_RADIO_LOCK` queried directly) -- confirmed unlocked (`0x00`) both
+   before and after requesting radio state ON, with all parameters correctly set.
+3. **Firmware-level command dispatch bugs** -- ruled out once the test script's own
+   initial KISS-escaping bug was fixed (an early version didn't escape a `0xC0` byte that
+   happened to appear inside the frequency value, corrupting that one command -- a good
+   reminder that hand-rolled protocol tests need to implement escaping correctly too, not
+   just the firmware).
+
+With those ruled out, the remaining candidate in `startRadio()`'s gating logic was
+`hw_ready`, which traced to `device_init()` in `Device.h`:
+
+```cpp
+bool device_init() {
+  #if VALIDATE_FIRMWARE
+  if (bt_ready) {
+    ...
+    return device_init_done && fw_signature_validated;
+  } else {
+    return false;
+  }
+```
+
+`VALIDATE_FIRMWARE` defaults to `true` (`Boards.h`) and was never overridden for this
+board. `fw_signature_validated` requires a live-computed hash of the running firmware to
+match a host-provided target hash (`dev_firmware_hash_target`, set via `rnodeconf
+--firmware-hash` / the web flasher's "Set Firmware Hash" button) -- a step that had been
+documented as necessary earlier in this process but never actually performed.
+
+### The actual root cause: a hardcoded, wrong flash address
+
+Attempting to set the firmware hash (`./partition_hashes from_device <port>`) returned
+`e3b0c442...b855` -- which is exactly `SHA256("")`, the hash of zero bytes. The firmware
+computes this hash over a region of flash defined by two constants in `Device.h`:
+
+```cpp
+#define APPLICATION_START 0x26000
+#define IMG_SIZE_START 0xFF008
+```
+
+`APPLICATION_START` is hardcoded and unconditional, no per-board override. `0x26000` is
+the *old* S140 v6 application start address -- exactly what Part 3 of this document
+already established is wrong for this board (our real start is `0x27000`, per the linker
+script fix). Every *other* nRF52 board in this codebase uses S140 v6 and genuinely does
+start at `0x26000`, which is why this was never wrong until now -- this board is the
+first in the codebase using S140 v7's differently-sized reserved region.
+
+Reading the actual flash contents at `IMG_SIZE_START` directly via SWD/OpenOCD confirmed
+this precisely:
+```
+mdw 0xFF008 4
+0x000ff008: 00000000 00000000 00000000 00000000
+```
+Genuinely all zeros -- not `0xFF` (which is what erased-but-unwritten NOR flash normally
+reads as), meaning this isn't just "unpopulated," but specifically not what this firmware
+code expects to find there. `retrieve_application_size()` reads this location expecting a
+bootloader-populated application-size field (a common pattern for Adafruit-style nRF52
+bootloaders), and gets `0`, which is why the hash comes out as `SHA256("")` -- the hash
+loop runs zero iterations. This most likely reflects a genuine layout or field difference
+between Seeed's downstream bootloader build (`v0.6.2`) and whatever bootloader-settings-
+page convention this firmware code was originally written against, though this wasn't
+independently confirmed beyond ruling out the simpler "wrong start address only" theory.
+
+### The fix applied here, and the tradeoff it represents
+
+Rather than reverse-engineer the exact correct bootloader-settings-page layout (real,
+open-ended work with no guaranteed answer), `VALIDATE_FIRMWARE` was disabled for this
+board specifically:
+
+```cpp
+#define VALIDATE_FIRMWARE false
+```
+
+**This is a genuine security tradeoff, not a cosmetic fix.** `VALIDATE_FIRMWARE`/
+`fw_signature_validated` exists to verify the running firmware hasn't been tampered with
+since it was flashed. Disabling it means this device can no longer detect that on its
+own. For a device that's built, flashed, and used entirely by one person, this is a
+defensible tradeoff -- but it should be flagged prominently, not carried forward quietly,
+in any future review or upstream discussion. The two real paths forward, in order of
+effort:
+1. **(applied here)** Disable `VALIDATE_FIRMWARE` for this board -- fast, unblocks
+   everything, but gives up firmware integrity verification.
+2. **(not attempted)** Determine the actual bootloader-settings-page layout Seeed's
+   `v0.6.2` bootloader uses and provide correct board-specific values for
+   `APPLICATION_START`/`IMG_SIZE_START` -- the "real" fix, but open-ended.
+
+With this fix applied, `hw_ready` becomes reachable, and the radio turns on and reports
+real state correctly -- confirmed via the raw KISS test script (`RADIO_STATE=ON` now
+returns `01`) and via a live RNS/Sideband session (see Part 8).
+
+---
+
+## Part 8 — Using the device as a real Reticulum interface
+
+Once provisioned (Part 5) and with the TX power and radio-enable fixes applied (Parts 6
+and 7), the device works as a standard `RNodeInterface` in a normal Reticulum config.
+
+Example `~/.reticulum/config` interface block:
+```
+[[RNode LoRa Interface]]
+  type = RNodeInterface
+  enabled = Yes
+  port = /dev/cu.usbmodemXXXX
+  frequency = 915000000
+  bandwidth = 125000
+  txpower = 7
+  spreadingfactor = 8
+  codingrate = 7
+```
+
+Nothing in this config is Wio-Tracker-specific -- any config within the board's confirmed
+capabilities (820-1020 MHz, up to 22 dBm) should work identically to any other RNode once
+the firmware-side fixes above are in place.
+
+**Do not use `rnodeconf --autoinstall` or its guided device-type menu** when working with
+this device -- both assume a known, listed board and will offer to flash a generic stock
+firmware image for whatever board is selected, silently overwriting this custom build.
+
+**Confirmed working**, via Sideband's Reticulum Status view:
+```
+RNodeInterface[RNode LoRa Interface]
+    Status    : Up
+    Mode      : Full
+    Rate      : 2.23 kbps
+    Noise Fl. : -104 dBm, no interference
+    Traffic   : tx 219 B      0 bps
+                rx 0 B        0 bps
+```
+The noise-floor reading in particular is a genuine live RF measurement from the SX1262's
+receiver, not just a reported "on" status -- confirming the radio is actually listening,
+not merely claiming to be. Real two-node TX/RX has not yet been separately tested (see
+Part 9).
+
+---
+
+## Part 9 — Open questions / unverified assumptions
 
 - **OLED display is currently disabled (`HAS_DISPLAY false`)** and is the main remaining
   known gap. The firmware links `Adafruit_SSD1306`, but Zephyr's official hardware
@@ -698,11 +939,11 @@ switches to TNC mode without error.
 - **GPS (L76K) is entirely unimplemented.** The schematic shows GPS UART/reset/wakeup
   pins, and `BOARD_HELTEC_T114`'s `MODEL_CB` variant shows precedent for `HAS_GPS` in
   this codebase, but this hasn't been attempted here.
-- **Actual over-the-air radio TX/RX has not been tested** — everything confirmed so far
-  is: the SX1262 initializes, reports correct chip/frequency-range info, and accepts
-  frequency/bandwidth/SF/CR configuration commands without error. A real two-node
-  transmission test (or checking against an SDR) would be the next real confirmation that
-  the radio is fully functional, not just correctly configured.
+- **Real two-node over-the-air TX/RX has not been separately confirmed.** The radio is
+  confirmed live and receiving (real -104 dBm noise-floor reading via a working RNS
+  interface, Part 8), and TX power is confirmed correctly applied (Part 6), but an actual
+  transmission received by a second node (or checked against an SDR) would be the next
+  real confirmation that TX is fully functional end to end, not just correctly configured.
 - **Device signature trust** — the device is provisioned and self-signed with a locally
   generated key (via the web flasher's initial provisioning attempt, later fully
   completed via `rnodeconf`'s own bootstrap). `rnodeconf` on *other* machines will show
@@ -721,3 +962,53 @@ switches to TNC mode without error.
   public Arduino board index, and getting the `rnodeconf` write-timing/display bugs fixed
   in the actual Reticulum project (the timing issue in particular seems like it could
   affect any board using flash-emulated EEPROM, not just this one).
+- **The exact cause of `IMG_SIZE_START` reading zero (Part 7) was never fully confirmed**
+  beyond ruling out the simpler "just a wrong start address" explanation. Whether this is
+  a genuine bootloader-settings-page layout difference in Seeed's `v0.6.2` build, a
+  different field at that offset entirely, or something else, wasn't determined. Anyone
+  picking this up should treat "disable `VALIDATE_FIRMWARE`" as the known-working but
+  non-ideal fix, not as evidence the deeper question has been answered.
+
+---
+
+## Part 10 — Prioritized list for upstream contribution
+
+Everything below is grouped by how likely it is to be a genuine, board-agnostic
+improvement to `RNode_Firmware_CE` itself, versus something specific to bringing up a new,
+non-standard board -- worth keeping this distinction clear in any future review or PR
+discussion, per `CONTRIBUTING.md`'s requirement that all contributions be hand-written and
+independently verified, not just lifted from this document.
+
+**High confidence, board-agnostic bug fixes -- likely worth a PR on their own, independent
+of whether Wio Tracker L1 Pro support itself ever goes upstream:**
+- The `setTXPower()` model-table gap (Part 6). A real bug affecting any future board
+  added without remembering to add itself to that specific list; the maintainer's own
+  TODO comment acknowledges the function needs revamping. Smallest, cleanest, most
+  self-contained fix in this whole session.
+- The `while (!Serial)` boot-wait exclusion (Part 2.3B) is a one-line addition to an
+  existing pattern already applied to every other nRF52 board -- low-risk, easy to
+  verify, though it only matters for a board that isn't already on that list.
+
+**Real board-support contribution, but needs a design decision from a maintainer, not just
+a bug fix -- the `VALIDATE_FIRMWARE`/`APPLICATION_START` question (Part 7):**
+- Whether the "right" fix is board-specific `APPLICATION_START`/`IMG_SIZE_START` values
+  (if the actual bootloader-settings-page layout can be determined), or an explicit,
+  documented opt-out mechanism for boards with non-standard bootloaders, is a real open
+  design question -- not something to resolve unilaterally in a PR without discussion.
+
+**Genuinely specific to this board (or to the toolchain gap around it), not upstream
+material for the firmware repo itself:**
+- The pin mapping, SPI/TCXO/DIO2 configuration (Parts 1-2).
+- The entire hybrid Arduino board definition (Part 3) -- the real fix here belongs in a
+  public Arduino board index (Seeed's own, ideally), not in `RNode_Firmware_CE` itself.
+- The SoftDevice/bootloader mismatch and its SWD-based diagnosis (Part 4) -- specific to
+  whatever this individual unit's history was; worth writing up as a general debugging
+  technique/reference (this README already does that) more than as firmware code.
+- The `rnodeconf` write-timing and display-crash bugs (Part 5) -- genuine bugs, but in
+  the separate Reticulum/`rnodeconf` project, not `RNode_Firmware_CE`.
+
+**Not yet attempted, needed before Wio Tracker L1 Pro support could reasonably be
+considered complete enough for a board-support PR:**
+- OLED display (SH1106 driver swap, Part 9).
+- GPS support.
+- Confirmed two-node TX/RX.

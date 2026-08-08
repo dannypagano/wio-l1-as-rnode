@@ -1283,6 +1283,7 @@ void setTXPower(RadioInterface* radio, int txp) {
     if (model == MODEL_C6) radio->setTxPower(txp, PA_OUTPUT_RFO_PIN);
     if (model == MODEL_C7) radio->setTxPower(txp, PA_OUTPUT_RFO_PIN);
     if (model == MODEL_CA) radio->setTxPower(txp, PA_OUTPUT_PA_BOOST_PIN);
+    if (model == MODEL_1A) radio->setTxPower(txp, PA_OUTPUT_PA_BOOST_PIN); // Wio Tracker L1 Pro, SX1262 -- see README.md Part 7
 
     if (model == MODEL_D4) radio->setTxPower(txp, PA_OUTPUT_PA_BOOST_PIN);
     if (model == MODEL_D9) radio->setTxPower(txp, PA_OUTPUT_PA_BOOST_PIN);
