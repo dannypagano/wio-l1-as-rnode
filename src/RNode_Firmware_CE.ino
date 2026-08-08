@@ -1592,7 +1592,7 @@ void loop() {
   process_serial();
 
   #if HAS_DISPLAY
-    #if DISPLAY == OLED || DISPLAY == TFT || DISPLAY == ADAFRUIT_TFT
+    #if DISPLAY == OLED || DISPLAY == TFT || DISPLAY == ADAFRUIT_TFT || DISPLAY == MONO_OLED
     if (disp_ready) update_display();
     #elif DISPLAY == EINK_BW || DISPLAY == EINK_3C
     // Display refreshes take so long on e-paper displays that they can disrupt

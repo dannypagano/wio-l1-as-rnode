@@ -4,25 +4,35 @@ This document records, step by step, how to reproduce a working `RNode_Firmware_
 for the Seeed Studio Wio Tracker L1 Pro (nRF52840 + Wio-SX1262 + L76K GPS), starting from
 an unmodified clone of [`liberatedsystems/RNode_Firmware_CE`](https://github.com/liberatedsystems/RNode_Firmware_CE).
 
-**Status: confirmed working, live, as a real Reticulum interface.** The device boots, is
-provisioned and validated with `rnodeconf`, and has been used successfully as an
-`RNodeInterface` in a real Reticulum config (`rnsd`/Sideband) -- reporting `Status: Up`,
-real traffic counters, and a live noise-floor RF reading (-104 dBm), confirming the radio
-is genuinely receiving, not just reporting a fake "on" state. Real over-the-air TX/RX
-*between two nodes* has not yet been separately confirmed. The OLED display is currently
-disabled pending a driver swap (see Part 8).
+**Status: fully confirmed working, including the OLED display.** The device boots, is
+provisioned and validated with `rnodeconf`, has been used successfully as a live
+`RNodeInterface` (real -104 dBm noise-floor reading through Sideband, confirming the
+radio genuinely receives rather than just reporting a fake "on" state), and the OLED
+display now correctly initializes and updates. Real over-the-air TX/RX *between two
+nodes* has not yet been separately confirmed; GPS is unimplemented. See Part 10.
 
 **Two further bugs were found and fixed after initial radio bring-up** (Parts 6 and 7):
 a firmware bug that silently dropped TX power for any unlisted board model, and a
 bootloader/firmware mismatch that permanently blocked the radio from turning on at all
 under RNS (as opposed to `rnodeconf`, which uses different, less strict validation and
-didn't catch it). Part 8's fix in particular is a real security tradeoff (disables a
+didn't catch it). Part 7's fix in particular is a real security tradeoff (disables a
 firmware integrity check), not just a bug fix -- read it before assuming it's the right
 permanent answer.
 
+**A later session (Part 9) fixed the OLED display**, which turned out to be three small,
+independent bugs stacked on top of each other: a wrong I2C address, a wrong
+`Wire.begin()` call (nRF52's `TwoWire` doesn't accept ESP32-style `begin(sda, scl)`), and
+a missing `MONO_OLED` case in the main loop's display-refresh condition (the screen
+initialized once, drew the boot splash, and then simply never redrew again).
+Diagnosing this produced a real trap worth remembering for future debugging: an early
+attempt to read boot output over serial appeared to show the firmware hanging, when the
+"hang" was actually just unprintable KISS protocol framing bytes rendering as blank
+boxes in a terminal and getting silently dropped on copy-paste -- resolved only by
+logging raw hex instead of decoded text.
+
 **Upstream plan:** several fixes from this session are genuinely board-agnostic bugs
 (not just Wio Tracker L1 Pro accommodations) and are worth proposing upstream once
-reviewed and hand-verified per `CONTRIBUTING.md`'s no-LLM-authorship rule -- see Part 10
+reviewed and hand-verified per `CONTRIBUTING.md`'s no-LLM-authorship rule -- see Part 11
 for a prioritized list of what's likely worth submitting versus what's still an open
 question.
 
@@ -32,12 +42,15 @@ README.md                    -- this file
 src/Boards.h                 -- full file, drop-in replacement for RNode_Firmware_CE's Boards.h
 src/Utilities.h              -- full file, drop-in replacement for RNode_Firmware_CE's Utilities.h
 src/RNode_Firmware_CE.ino    -- full file, drop-in replacement for RNode_Firmware_CE's .ino
+src/Display.h                -- full file, drop-in replacement for RNode_Firmware_CE's Display.h
 src/Radio.cpp.patch          -- snippet only (not a full file) -- see Part 6
 src/Makefile.additions       -- snippet to append to RNode_Firmware_CE's Makefile
 toolchain/setup.sh           -- reproduces the hybrid Arduino board definition (Part 3)
 toolchain/wio_tracker.cfg    -- OpenOCD config for SWD debugging via a Raspberry Pi (Part 4)
 toolchain/patch_rnodeconf.py -- patches a local rnodeconf install for this board (Part 5)
 toolchain/kiss-debug-scripts/raw_initradio_test.py -- raw KISS protocol test tool (Part 7)
+toolchain/kiss-debug-scripts/serial_hexlog.py -- raw hex serial logger, avoids the
+                                                   text-encoding trap described in Part 9
 ```
 
 To use: clone `RNode_Firmware_CE` separately, copy the three files from `src/` over the
@@ -57,8 +70,8 @@ should hand-write and personally verify their own version of these changes.
 - MCU: Nordic nRF52840
 - Radio: Semtech SX1262 (Seeed "Wio-SX1262" module)
 - GPS: Quectel L76K (UART, not used by RNode firmware — no GPS support added)
-- Display: OLED, physically present on this board (1.3", likely SH1106 controller per
-  Zephyr's official board docs — see Part 9, currently disabled)
+- Display: OLED, physically present on this board (1.3", SH1106 controller (confirmed
+  correct per Zephyr's official board docs, and now working -- see Part 9)
 - Flash: external QSPI (not used by RNode firmware on this build — EEPROM emulation uses
   LittleFS on **internal** flash instead, see Part 4)
 - Bootloader: this specific unit's bootloader was reflashed at some point by Seeed support
@@ -913,22 +926,152 @@ RNodeInterface[RNode LoRa Interface]
 The noise-floor reading in particular is a genuine live RF measurement from the SX1262's
 receiver, not just a reported "on" status -- confirming the radio is actually listening,
 not merely claiming to be. Real two-node TX/RX has not yet been separately tested (see
-Part 9).
+Part 10).
 
 ---
 
-## Part 9 — Open questions / unverified assumptions
+## Part 9 — Fixing the OLED display
 
-- **OLED display is currently disabled (`HAS_DISPLAY false`)** and is the main remaining
-  known gap. The firmware links `Adafruit_SSD1306`, but Zephyr's official hardware
-  description for this exact board states the panel is an **SH1106** controller — a
-  different, incompatible init/command sequence despite identical form factor and I2C
-  protocol layer. This was directly observed: with `HAS_DISPLAY true`, the firmware would
-  hang inside `TwoWire::endTransmission()` (confirmed via OpenOCD/`addr2line`, PC
-  captured mid-I2C-transaction), consistent with the display never ACKing correctly.
-  Fixing this means swapping to `Adafruit_SH110X` in `Display.h` — a real but likely
-  fairly mechanical change, since both libraries share the Adafruit_GFX-based API. Not
-  yet attempted.
+With `HAS_DISPLAY false` (disabled since Part 4, when a live-hanging I2C transaction was
+one of several suspects during the SoftDevice investigation), the display was re-enabled
+and switched from `Adafruit_SSD1306` to `Adafruit_SH1106G` (from the `Adafruit_SH110X`
+library), matching the SH1106 controller Zephyr's official board docs describe for this
+panel. `Display.h` already had a working `MONO_OLED` code path (used by T-Beam Supreme),
+so most of the change was extending T-Beam Supreme's existing conditions with `||
+BOARD_MODEL == BOARD_WIO_TRACKER_L1` at each relevant call site (object declaration,
+`set_contrast()` overload, the `begin()` call) plus a new pin-override block. Three
+separate, independent bugs surfaced once this was actually tested on hardware.
+
+### Bug 1 — wrong I2C address
+
+The display never initialized (`display_init()` returned `false`). A minimal I2C bus
+scanner, added temporarily in `setup()` right after `Serial.begin()`, found the panel
+responding at `0x3D`, not the more common `0x3C` used as the initial guess:
+
+```cpp
+Serial.println("Starting I2C scan...");
+Wire.setPins(6, 5); // SDA, SCL
+Wire.begin();
+for (uint8_t addr = 1; addr < 127; addr++) {
+  Wire.beginTransmission(addr);
+  if (Wire.endTransmission() == 0) {
+    Serial.print("Found device at address 0x");
+    Serial.println(addr, HEX);
+  }
+}
+```
+
+Fix: `DISP_ADDR` for `BOARD_WIO_TRACKER_L1` in `Display.h`'s pin-override block set to
+`0x3D`.
+
+### Bug 2 — nRF52's `TwoWire` doesn't support ESP32-style `Wire.begin(sda, scl)`
+
+With the address fixed, the display initialized but the *build itself* started failing:
+`error: no matching function for call to 'TwoWire::begin(int, int)'`. The `Wire.begin(SDA_OLED,
+SCL_OLED)` call combined into T-Beam Supreme's existing condition works on T-Beam Supreme
+specifically because it's an **ESP32** board -- ESP32's Arduino core `TwoWire::begin()`
+accepts pin arguments directly, as a platform convenience. nRF52's `TwoWire` (this
+core's `libraries/Wire/Wire.h`) has no such overload; pins are set via a separate method
+first:
+
+```cpp
+class TwoWire : public Stream {
+  public:
+    void begin();
+    void begin(uint8_t);   // address, for slave mode -- not what we want
+    void setPins(uint8_t pinSDA, uint8_t pinSCL);
+    ...
+```
+
+Fix: split `BOARD_WIO_TRACKER_L1` out of the combined condition with `BOARD_TBEAM_S_V1`
+in `display_init()`, using the correct nRF52-specific two-call sequence:
+
+```cpp
+    #elif BOARD_MODEL == BOARD_WIO_TRACKER_L1
+      Wire.setPins(SDA_OLED, SCL_OLED);
+      Wire.begin();
+```
+
+No existing nRF52 board in this codebase drives an I2C OLED display, so there was no
+working precedent for this specific platform/peripheral combination to copy from --
+worth remembering when porting a new nRF52 board with an I2C display in the future.
+
+### Bug 3 — the KISS-framing red herring, and how it was resolved
+
+With both of the above fixed, the display showed the boot splash ("device starting")
+but never advanced, for what appeared to be a very long time (tens of seconds). A first
+attempt to read boot output over serial (`python3 -m serial.tools.miniterm`) kept
+crashing with `OSError: [Errno 6] Device not configured` -- caused by resets on this
+board dropping and re-enumerating the USB CDC connection, the same as a physical
+unplug. A small reconnecting logger script fixed the connection-drop problem, but
+consistently showed only a single, garbled character (`"U"`) before falling silent.
+
+This looked exactly like a hang, and an extensive OpenOCD-based investigation followed
+(SVD register captures, `PendSV`/`EXC_RETURN` decoding, `addr2line` tracing through
+`tud_cdc_n_write_flush` in TinyUSB) before two things were discovered that invalidated
+most of it:
+
+1. **The `.uf2` conversion step had been silently skipped** for several iterations --
+   `arduino-cli compile` followed directly by `cp ...uf2 /Volumes/XIAO-BOOT/`, with no
+   `uf2conv.py` call in between, meaning a stale binary was being tested (or flashing was
+   silently failing) while genuinely new source changes went untested. Several rounds of
+   OpenOCD register captures were taken against this stale/uncertain state.
+2. **Once a verified-fresh build was actually flashed and traced, the MCU was
+   completely healthy** -- repeated `halt`/`resume`/`halt` cycles showed the program
+   counter moving normally through different functions each time, not stuck anywhere.
+
+That redirected attention to the actual `"U"` output itself. A raw hex logger (logging
+`bytes.hex()` instead of decoded text) revealed the real content: `c0 55 f8 c0` --
+`FEND, 0x55, 0xF8, FEND` in KISS framing, a complete and valid `kiss_indicate_reset()`
+frame. `0xC0` (`FEND`) and `0xF8` are non-printable bytes that a terminal renders as
+blank boxes and that plain-text copy-paste silently drops; `0x55` happens to be the
+ASCII byte for `'U'`. **There was no hang at all** -- this was valid protocol output the
+entire time, misread as corruption because it was being viewed through a text-decoding
+tool instead of a raw byte view.
+
+**Lesson for future debugging on this firmware:** always log raw hex when reading serial
+output from a KISS/binary protocol device, never decoded text -- printable-looking
+fragments surrounded by silence are a strong signal of exactly this trap, not evidence of
+a hang. `toolchain/kiss-debug-scripts/serial_hexlog.py` in this repo implements this.
+
+### The actual remaining bug
+
+With the "hang" ruled out and `rnodeconf -i` confirming the device was fully valid
+(checksum correct, signature validated, `Device mode: Normal (host-controlled)`) even
+while the screen stayed frozen, the real cause turned out to be much simpler and
+entirely unrelated to any of the above: `loop()`'s periodic display-refresh condition
+had never been updated for `MONO_OLED` boards at all:
+
+```cpp
+  #if HAS_DISPLAY
+    #if DISPLAY == OLED || DISPLAY == TFT || DISPLAY == ADAFRUIT_TFT
+    if (disp_ready) update_display();
+```
+
+This condition predates any `MONO_OLED` board using periodic (non-e-ink) refresh --
+T-Beam Supreme, the only prior `MONO_OLED` board, was never checked against this
+specific line. Without `MONO_OLED` included, `update_display()` runs exactly once (the
+one-time call in `setup()`, which draws the boot splash) and then never again --
+producing a display that looks frozen indefinitely, regardless of what `hw_ready`/
+`device_init_done` become afterward. This has nothing to do with hangs, USB, or KISS
+framing; it's simply a screen nobody ever tells to redraw again.
+
+Fix:
+```cpp
+    #if DISPLAY == OLED || DISPLAY == TFT || DISPLAY == ADAFRUIT_TFT || DISPLAY == MONO_OLED
+    if (disp_ready) update_display();
+```
+
+With all three fixes in place, the display correctly shows live status and updates
+continuously, matching every other supported board.
+
+---
+
+## Part 10 — Open questions / unverified assumptions
+
+- **OLED display: fixed, see Part 9.** No longer an open question -- kept here only as
+  a pointer since earlier parts of this document (Part 4 in particular) still describe it
+  as disabled/hanging, which was true at the time but is now resolved.
 - **`NRF_SPIM3` for the radio SPI** — chosen by elimination (SPIM0/1 claimed by the two
   I2C buses), and now confirmed working via a fully functional radio. `NRF_SPIM2` was
   never needed.
@@ -971,7 +1114,7 @@ Part 9).
 
 ---
 
-## Part 10 — Prioritized list for upstream contribution
+## Part 11 — Prioritized list for upstream contribution
 
 Everything below is grouped by how likely it is to be a genuine, board-agnostic
 improvement to `RNode_Firmware_CE` itself, versus something specific to bringing up a new,
@@ -1009,6 +1152,7 @@ material for the firmware repo itself:**
 
 **Not yet attempted, needed before Wio Tracker L1 Pro support could reasonably be
 considered complete enough for a board-support PR:**
-- OLED display (SH1106 driver swap, Part 9).
 - GPS support.
 - Confirmed two-node TX/RX.
+
+(OLED display support is now complete -- see Part 9 -- and no longer belongs in this list.)
